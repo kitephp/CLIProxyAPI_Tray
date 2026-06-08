@@ -183,7 +183,7 @@ function Get-SystemArchitecture {
         String - "amd64" or "arm64"
     #>
     $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-    return $(if ($arch -eq "Arm64") { "arm64" } else { "amd64" })
+    return $(if ($arch -eq "Arm64") { "aarch64" } else { "amd64" })
 }
 
 function Test-DirectoryWritable {
@@ -916,18 +916,8 @@ function Invoke-PackageDownload {
     )
 
     if (-not $ShowProgress) {
-        # Simple synchronous download without UI
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", $script:Config.AppName)
-
-        try {
-            Show-BalloonTip "Downloading CLIProxyAPI..." -Icon Info -Duration 1200
-            $webClient.DownloadFile($PackageUrl, $OutputPath)
-        }
-        finally {
-            $webClient.Dispose()
-        }
-
+        Show-BalloonTip "Downloading CLIProxyAPI..." -Icon Info -Duration 1200
+        Invoke-WebRequest -Uri $PackageUrl -OutFile $OutputPath -UseBasicParsing -ErrorAction Stop
         return
     }
 
@@ -954,16 +944,15 @@ function Invoke-PackageDownload {
     $form.Controls.Add($layout)
 
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = "Preparing download..."
+    $label.Text = "Downloading CLIProxyAPI..."
     $label.Dock = "Fill"
     $label.TextAlign = "MiddleLeft"
     $layout.Controls.Add($label, 0, 0)
 
     $progressBar = New-Object System.Windows.Forms.ProgressBar
     $progressBar.Dock = "Fill"
-    $progressBar.Minimum = 0
-    $progressBar.Maximum = 100
-    $progressBar.Style = "Continuous"
+    $progressBar.Style = "Marquee"
+    $progressBar.MarqueeAnimationSpeed = 30
     $layout.Controls.Add($progressBar, 0, 1)
 
     $detailLabel = New-Object System.Windows.Forms.Label
@@ -972,61 +961,46 @@ function Invoke-PackageDownload {
     $detailLabel.TextAlign = "TopLeft"
     $layout.Controls.Add($detailLabel, 0, 2)
 
-    $webClient = New-Object System.Net.WebClient
-    $webClient.Headers.Add("User-Agent", $script:Config.AppName)
+    # Run download in background PowerShell instance
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    [void]$ps.AddScript({
+        param($Url, $Path)
+        Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -ErrorAction Stop
+    }).AddArgument($PackageUrl).AddArgument($OutputPath)
 
-    # Download state
-    $script:DownloadError = $null
+    $asyncHandle = $ps.BeginInvoke()
 
-    # Progress event
-    $webClient.add_DownloadProgressChanged({
-        param($sender, $e)
-        $progressBar.Value = [Math]::Max(0, [Math]::Min(100, $e.ProgressPercentage))
-        $label.Text = "Downloading CLIProxyAPI..."
-
-        $receivedMb = [math]::Round($e.BytesReceived / 1MB, 1)
-        if ($e.TotalBytesToReceive -gt 0) {
-            $totalMb = [math]::Round($e.TotalBytesToReceive / 1MB, 1)
-            $detailLabel.Text = "$($e.ProgressPercentage)%  $receivedMb MB / $totalMb MB"
-        }
-        else {
-            $detailLabel.Text = "$receivedMb MB downloaded"
-        }
-    })
-
-    # Completion event
-    $webClient.add_DownloadFileCompleted({
-        param($sender, $e)
-
-        if ($e.Error) {
-            $script:DownloadError = $e.Error
-            $form.Close()
-            return
-        }
-
-        $form.Close()
-    })
-
-    # Start download when form is shown
-    $form.add_Shown({
+    # Poll timer - checks completion and shows downloaded size
+    $pollTimer = New-Object System.Windows.Forms.Timer
+    $pollTimer.Interval = 300
+    $pollTimer.Add_Tick({
         try {
-            $webClient.DownloadFileAsync($PackageUrl, $OutputPath)
+            if (Test-Path -LiteralPath $OutputPath) {
+                $sizeMb = [math]::Round((Get-Item -LiteralPath $OutputPath).Length / 1MB, 1)
+                $detailLabel.Text = "$sizeMb MB downloaded..."
+            }
+            if ($asyncHandle.IsCompleted) {
+                $pollTimer.Stop()
+                $form.Close()
+            }
         }
-        catch {
-            $script:DownloadError = $_.Exception
-            $form.Close()
-        }
+        catch {}
     })
+    $pollTimer.Start()
 
-    # Show modal dialog (blocks but pumps messages)
     $form.ShowDialog() | Out-Null
-
-    # Cleanup
     $form.Dispose()
-    $webClient.Dispose()
+    $pollTimer.Stop()
+    $pollTimer.Dispose()
 
-    if ($script:DownloadError) {
-        throw $script:DownloadError
+    try {
+        $ps.EndInvoke($asyncHandle) | Out-Null
+        if ($ps.Streams.Error.Count -gt 0) {
+            throw $ps.Streams.Error[0].Exception
+        }
+    }
+    finally {
+        $ps.Dispose()
     }
 }
 #endregion
